@@ -30,6 +30,13 @@ export class Adapter implements AdapterInterface {
     }
 
     /**
+     * Initialize the adapter.
+     */
+    async init(): Promise<AdapterInterface> {
+        return await this.driver.init();
+    }
+
+    /**
      * Get the app namespace.
      */
     getNamespace(appId: string): Namespace {
@@ -41,6 +48,36 @@ export class Adapter implements AdapterInterface {
      */
     getNamespaces(): Map<string, Namespace> {
         return this.driver.getNamespaces();
+    }
+
+    /**
+     * Add a new socket to the namespace.
+     */
+    async addSocket(appId: string, ws: WebSocket): Promise<boolean> {
+        return this.driver.addSocket(appId, ws);
+    }
+
+    /**
+     * Remove a socket from the namespace.
+     */
+    async removeSocket(appId: string, wsId: string): Promise<boolean> {
+        return this.driver.removeSocket(appId, wsId);
+    }
+
+    /**
+     * Add a socket ID to the channel identifier.
+     * Return the total number of connections after the connection.
+     */
+    async addToChannel(appId: string, channel: string, ws: WebSocket): Promise<number> {
+        return this.driver.addToChannel(appId, channel, ws);
+    }
+
+    /**
+     * Remove a socket ID from the channel identifier.
+     * Return the total number of connections remaining to the channel.
+     */
+    async removeFromChannel(appId: string, channel: string|string[], wsId: string): Promise<number|void> {
+        return this.driver.removeFromChannel(appId, channel, wsId);
     }
 
     /**
@@ -62,6 +99,13 @@ export class Adapter implements AdapterInterface {
      */
     async getChannels(appId: string, onlyLocal = false): Promise<Map<string, Set<string>>> {
         return this.driver.getChannels(appId, onlyLocal);
+    }
+
+    /**
+     * Get the list of channels with the websockets count.
+     */
+    async getChannelsWithSocketsCount(appId: string, onlyLocal = false): Promise<Map<string, number>> {
+        return this.driver.getChannelsWithSocketsCount(appId, onlyLocal);
     }
 
     /**
@@ -100,6 +144,14 @@ export class Adapter implements AdapterInterface {
     }
 
     /**
+     * Signal that someone is using the app. Usually,
+     * subscribe to app-specific channels in the adapter.
+     */
+    subscribeToApp(appId: string): Promise<void> {
+        return this.driver.subscribeToApp(appId);
+    }
+
+    /**
      * Send a message to a namespace and channel.
      */
     send(appId: string, channel: string, data: string, exceptingId: string|null = null): void {
@@ -107,9 +159,51 @@ export class Adapter implements AdapterInterface {
     }
 
     /**
-     * Clear the local namespaces.
+     * Terminate an User ID's connections.
      */
-    clear(namespaceId?: string, closeConnections = false): Promise<void> {
-        return this.driver.clear(namespaceId, closeConnections);
+    terminateUserConnections(appId: string, userId: number|string): void {
+        return this.driver.terminateUserConnections(appId, userId);
+    }
+
+    /**
+     * Add to the users list the associated socket connection ID.
+     */
+    addUser(ws: WebSocket): Promise<void> {
+        return this.driver.addUser(ws);
+    }
+
+    /**
+     * Remove the user associated with the connection ID.
+     */
+    removeUser(ws: WebSocket): Promise<void> {
+        return this.driver.removeUser(ws);
+    }
+
+    /**
+     * Get the sockets associated with an user.
+     */
+    getUserSockets(appId: string, userId: string|number): Promise<Set<WebSocket>> {
+        return this.driver.getUserSockets(appId, userId);
+    }
+
+    /**
+     * Clear the namespace from the local adapter.
+     */
+    clearNamespace(namespaceId: string): Promise<void> {
+        return this.driver.clearNamespace(namespaceId);
+    }
+
+    /**
+     * Clear all namespaces from the local adapter.
+     */
+    clearNamespaces(): Promise<void> {
+        return this.driver.clearNamespaces();
+    }
+
+    /**
+     * Clear the connections.
+     */
+    disconnect(): Promise<void> {
+        return this.driver.disconnect();
     }
 }

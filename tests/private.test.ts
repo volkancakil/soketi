@@ -143,4 +143,64 @@ describe('private channel test', () => {
             });
         });
     });
+
+    test('cached private channels work', done => {
+        Utils.newServer({}, (server: Server) => {
+            let client1 = Utils.newClientForPrivateChannel();
+            let backend = Utils.newBackend();
+            let channelName = `private-cache-${Utils.randomChannelName()}`;
+
+            client1.connection.bind('connected', () => {
+                let channel = client1.subscribe(channelName);
+
+                channel.bind('pusher:subscription_succeeded', () => {
+                    channel.bind('pusher:cache_miss', (data) => {
+                        expect(data).toBe(undefined);
+
+                        channel.bind('greeting', e => {
+                            expect(e.message).toBe('hello');
+    
+                            let client2 = Utils.newClientForPrivateChannel();
+    
+                            client2.connection.bind('connected', () => {
+                                let channel = client2.subscribe(channelName);
+
+                                channel.bind('pusher:cache_miss', () => {
+                                    throw new Error('Did not expect cache_miss to be invoked.');
+                                });
+
+                                channel.bind('greeting', e => {
+                                    expect(e.message).toBe('hello');
+                                    done()
+                                })
+                            });
+                        });
+                    });
+
+                    backend.trigger(channelName, 'greeting', { message: 'hello' }).catch(error => {
+                        throw new Error(error);
+                    });
+                });
+            });
+        });
+    });
+
+    Utils.shouldRun(Utils.appManagerIs('array'))('user authentication works if conn immediately joins a private channel', (done) => {
+        Utils.newServer({ 'appManager.array.apps.0.enableUserAuthentication': true, 'userAuthenticationTimeout': 5_000 }, (server: Server) => {
+            let client = Utils.newClientForPrivateChannel();
+            let channelName = `private-${Utils.randomChannelName()}`;
+
+            client.connection.bind('connected', () => {
+                let channel = client.subscribe(channelName);
+
+                channel.bind('pusher:subscription_succeeded', () => {
+                    // After subscription, wait 10 seconds to make sure it isn't disconnected
+                    setTimeout(() => {
+                        client.disconnect();
+                        done();
+                    }, 10_000);
+                });
+            });
+        });
+    });
 });

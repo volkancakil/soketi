@@ -8,10 +8,6 @@ on:
       - '*'
     paths-ignore:
       - "**.md"
-      - "benchmark/**"
-      - ".github/workflows/benchmark.yml"
-      - ".github/workflows/docker-*.yml"
-      - ".github/*.yml"
   pull_request:
     branches:
       - '*'
@@ -42,19 +38,26 @@ jobs:
           - adapter: local
             rate_limiter: local
             queue_driver: sync
+            cache_driver: memory
+          - adapter: local
+            rate_limiter: local
+            queue_driver: sqs
+            cache_driver: memory
           - adapter: cluster
             rate_limiter: cluster
             queue_driver: sync
+            cache_driver: redis
           - adapter: redis
             rate_limiter: redis
             queue_driver: redis
+            cache_driver: redis
 
     name: Node.js ${{ matrix.node }} (adapter:${{ matrix.adapter }} manager:${{ matrix.app_manager }} ratelimiter:${{ matrix.rate_limiter }} queue:${{ matrix.queue_driver }})
 
     steps:
-      - uses: actions/checkout@v2.4.0
+      - uses: actions/checkout@v3.5.3
 
-      - uses: actions/setup-node@v2.5.1
+      - uses: actions/setup-node@v3.7.0
         name: Setup Node.js v${{ matrix.node }}
         with:
           node-version: ${{ matrix.node }}
@@ -69,7 +72,7 @@ jobs:
 
       - name: Setup Redis
         if: "matrix.adapter == 'redis' || matrix.adapter == 'cluster'"
-        run: docker run -p 6379:6379 redis:6-alpine &
+        run: docker-compose up -d redis
 
       # Setup MySQL with user `root`, password `root` and database `testing`
       - name: Setup MySQL
@@ -94,11 +97,32 @@ jobs:
       - name: Setup DynamoDB
         if: "matrix.app_manager == 'dynamodb'"
         run: |
-          docker run -p 8000:8000 amazon/dynamodb-local &
+          docker run -p 8000:8000 amazon/dynamodb-local:1.22.0 &
           node tests/fixtures/dynamodb_schema.js
         env:
           AWS_ACCESS_KEY_ID: fake-id
           AWS_SECRET_ACCESS_KEY: fake-secret
+
+      - name: Setup Localstack
+        if: "matrix.queue_driver == 'sqs'"
+        run: |
+          docker-compose up -d localstack
+          sleep 5
+          pip install localstack awscli-local[ver1]
+          awslocal s3 mb s3://test
+          awslocal s3 ls
+          awslocal sqs create-queue --queue-name test.fifo \
+            --attributes='{
+              "FifoQueue": "true",
+              "ContentBasedDeduplication": "true",
+              "DeduplicationScope": "messageGroup",
+              "FifoThroughputLimit": "perMessageGroupId",
+              "MessageRetentionPeriod": "3600",
+              "ReceiveMessageWaitTimeSeconds": "1",
+              "VisibilityTimeout": "5"
+            }' \
+            --region us-east-1
+          awslocal sqs list-queues
 
       - name: Execute tests
         run: npm run test
@@ -106,14 +130,16 @@ jobs:
           RETRY_TIMES: 2
           TEST_ADAPTER: ${{ matrix.adapter }}
           TEST_APP_MANAGER: ${{ matrix.app_manager }}
+          TEST_CACHE_DRIVER: ${{ matrix.cache_driver }}
           TEST_QUEUE_DRIVER: ${{ matrix.queue_driver }}
           TEST_RATE_LIMITER: ${{ matrix.rate_limiter }}
           TEST_MYSQL_USER: root
           TEST_MYSQL_PASSWORD: root
+          TEST_SQS_URL: http://localhost:4566/000000000000/test.fifo
           AWS_ACCESS_KEY_ID: fake-id
           AWS_SECRET_ACCESS_KEY: fake-secret
 
-      - uses: codecov/codecov-action@v2.1.0
+      - uses: codecov/codecov-action@v3.1.4
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false

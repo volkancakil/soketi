@@ -20,6 +20,18 @@ export class Utils {
     ];
 
     /**
+     * Channels with patters for caching channels.
+     *
+     * @type {string[]}
+     */
+    protected static _cachingChannelPatterns: string[] = [
+        'cache-*',
+        'private-cache-*',
+        'private-encrypted-cache-*',
+        'presence-cache-*',
+    ];
+
+    /**
      * Get the amount of bytes from given parameters.
      */
     static dataToBytes(...data: any): number {
@@ -80,6 +92,23 @@ export class Utils {
     }
 
     /**
+     * Check if the given channel accepts caching.
+     */
+    static isCachingChannel(channel: string): boolean {
+        let isCachingChannel = false;
+
+        this._cachingChannelPatterns.forEach(pattern => {
+            let regex = new RegExp(pattern.replace('*', '.*'));
+
+            if (regex.test(channel)) {
+                isCachingChannel = true;
+            }
+        });
+
+        return isCachingChannel;
+    }
+
+    /**
      * Check if client is a client event.
      */
     static isClientEvent(event: string): boolean {
@@ -94,5 +123,13 @@ export class Utils {
         });
 
         return isClientEvent;
+    }
+
+    /**
+     * Check if the channel name is restricted for connections from the client.
+     * Read: https://pusher.com/docs/channels/using_channels/channels/#channel-naming-conventions
+     */
+    static restrictedChannelName(name: string) {
+        return /^#?[-a-zA-Z0-9_=@,.;]+$/.test(name) === false;
     }
 }

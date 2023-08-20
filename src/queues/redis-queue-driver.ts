@@ -1,9 +1,9 @@
 import async from 'async';
+import { JobData } from '../webhook-sender';
 import { Queue, Worker, QueueScheduler } from 'bullmq'
 import { QueueInterface } from './queue-interface';
+import Redis, { Cluster, ClusterOptions, RedisOptions } from 'ioredis';
 import { Server } from '../server';
-
-const Redis = require('ioredis');
 
 interface QueueWithWorker {
     queue: Queue;
@@ -27,7 +27,7 @@ export class RedisQueueDriver implements QueueInterface {
     /**
      * Add a new event with data to queue.
      */
-    addToQueue(queueName: string, data: any = {}): Promise<void> {
+    addToQueue(queueName: string, data: JobData): Promise<void> {
         return new Promise(resolve => {
             let queueWithWorker = this.queueWithWorker.get(queueName);
 
@@ -45,22 +45,32 @@ export class RedisQueueDriver implements QueueInterface {
     processQueue(queueName: string, callback: CallableFunction): Promise<void> {
         return new Promise(resolve => {
             if (!this.queueWithWorker.has(queueName)) {
-                const connection = new Redis({
+                let redisOptions: RedisOptions|ClusterOptions = {
                     maxRetriesPerRequest: null,
                     enableReadyCheck: false,
+                    retryDelayOnClusterDown: 50,
+                    retryDelayOnMoved: 10,
+                    retryDelayOnTryAgain: 50,
+                    retryDelayOnFailover: 50,
                     ...this.server.options.database.redis,
+                    ...this.server.options.queue.redis.redisOptions,
                     // We set the key prefix on the queue, worker and scheduler instead of on the connection itself
                     keyPrefix: undefined,
-                });
+                };
 
-                // We remove a trailing `:` from the prefix because BullMQ adds that already
-                const prefix = this.server.options.database.redis.keyPrefix.replace(/:$/, '');
+                const connection = this.server.options.queue.redis.clusterMode
+                    ? new Cluster(this.server.options.database.redis.clusterNodes, { scaleReads: 'slave', ...redisOptions })
+                    : new Redis(redisOptions);
 
-                const sharedOptions = { prefix, connection };
+                const queueSharedOptions = {
+                    // We remove a trailing `:` from the prefix because BullMQ adds that already
+                    prefix: this.server.options.database.redis.keyPrefix.replace(/:$/, ''),
+                    connection,
+                };
 
                 this.queueWithWorker.set(queueName, {
                     queue: new Queue(queueName, {
-                        ...sharedOptions,
+                        ...queueSharedOptions,
                         defaultJobOptions: {
                             attempts: 6,
                             backoff: {
@@ -73,12 +83,12 @@ export class RedisQueueDriver implements QueueInterface {
                     }),
                     // TODO: Sandbox the worker? https://docs.bullmq.io/guide/workers/sandboxed-processors
                     worker: new Worker(queueName, callback as any, {
-                        ...sharedOptions,
+                        ...queueSharedOptions,
                         concurrency: this.server.options.queue.redis.concurrency,
                     }),
                     // TODO: Seperate this from the queue with worker when multipe workers are supported.
                     //       A single scheduler per queue is needed: https://docs.bullmq.io/guide/queuescheduler
-                    scheduler: new QueueScheduler(queueName, sharedOptions),
+                    scheduler: new QueueScheduler(queueName, queueSharedOptions),
                 });
             }
 
@@ -89,7 +99,7 @@ export class RedisQueueDriver implements QueueInterface {
     /**
      * Clear the queues for a graceful shutdown.
      */
-    clear(): Promise<void> {
+    disconnect(): Promise<void> {
         return async.each([...this.queueWithWorker], ([queueName, { queue, worker, scheduler }]: [string, QueueWithWorker], callback) => {
             scheduler.close().then(() => {
                 worker.close().then(() => callback());

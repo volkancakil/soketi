@@ -1,14 +1,13 @@
 import { LocalRateLimiter } from './local-rate-limiter';
 import { RateLimiterAbstract, RateLimiterRedis } from 'rate-limiter-flexible';
+import Redis, { Cluster, ClusterOptions, RedisOptions } from 'ioredis';
 import { Server } from '../server';
-
-const Redis = require('ioredis');
 
 export class RedisRateLimiter extends LocalRateLimiter {
     /**
      * The Redis connection.
      */
-    protected redisConnection: typeof Redis;
+    protected redisConnection: Redis|Cluster;
 
     /**
      * Initialize the Redis rate limiter driver.
@@ -16,7 +15,21 @@ export class RedisRateLimiter extends LocalRateLimiter {
     constructor(protected server: Server) {
         super(server);
 
-        this.redisConnection = new Redis(server.options.database.redis);
+        let redisOptions: ClusterOptions|RedisOptions = {
+            retryDelayOnClusterDown: 50,
+            retryDelayOnMoved: 10,
+            retryDelayOnTryAgain: 50,
+            retryDelayOnFailover: 50,
+            ...server.options.database.redis,
+            ...server.options.rateLimiter.redis.redisOptions,
+        };
+
+        this.redisConnection = server.options.rateLimiter.redis.clusterMode
+            ? new Cluster(server.options.database.redis.clusterNodes, {
+                scaleReads: 'slave',
+                ...redisOptions,
+            })
+            : new Redis(redisOptions);
     }
 
     /**
@@ -31,5 +44,14 @@ export class RedisRateLimiter extends LocalRateLimiter {
             // TODO: Insurance limiter?
             // insuranceLimiter: super.createNewRateLimiter(appId, maxPoints),
         }));
+    }
+
+    /**
+     * Clear the rate limiter or active connections.
+     */
+    disconnect(): Promise<void> {
+        return this.redisConnection.quit().then(() => {
+            //
+        });
     }
 }

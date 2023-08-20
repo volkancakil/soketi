@@ -29,6 +29,7 @@ export class HttpHandler {
 
     ready(res: HttpResponse) {
         this.attachMiddleware(res, [
+            this.corkMiddleware,
             this.corsMiddleware,
         ]).then(res => {
             if (this.server.closing) {
@@ -76,6 +77,7 @@ export class HttpHandler {
 
     healthCheck(res: HttpResponse) {
         this.attachMiddleware(res, [
+            this.corkMiddleware,
             this.corsMiddleware,
         ]).then(res => {
             this.send(res, 'OK');
@@ -84,6 +86,7 @@ export class HttpHandler {
 
     usage(res: HttpResponse) {
         this.attachMiddleware(res, [
+            this.corkMiddleware,
             this.corsMiddleware,
         ]).then(res => {
             let {
@@ -111,6 +114,7 @@ export class HttpHandler {
 
     metrics(res: HttpResponse) {
         this.attachMiddleware(res, [
+            this.corkMiddleware,
             this.corsMiddleware,
         ]).then(res => {
             let handleError = err => {
@@ -137,19 +141,25 @@ export class HttpHandler {
 
     channels(res: HttpResponse) {
         this.attachMiddleware(res, [
+            this.corkMiddleware,
             this.corsMiddleware,
             this.appMiddleware,
             this.authMiddleware,
             this.readRateLimitingMiddleware,
         ]).then(res => {
-            this.server.adapter.getChannels(res.params.appId).then(channels => {
+            this.server.adapter.getChannelsWithSocketsCount(res.params.appId).then(channels => {
                 let response: { [channel: string]: ChannelResponse } = [...channels].reduce((channels, [channel, connections]) => {
-                    if (connections.size === 0) {
+                    if (connections === 0) {
+                        return channels;
+                    }
+
+                    // In case ?filter_by_prefix= is specified, the channel must start with that prefix.
+                    if (res.query.filter_by_prefix && !channel.startsWith(res.query.filter_by_prefix)) {
                         return channels;
                     }
 
                     channels[channel] = {
-                        subscription_count: connections.size,
+                        subscription_count: connections,
                         occupied: true,
                     };
 
@@ -173,6 +183,7 @@ export class HttpHandler {
 
     channel(res: HttpResponse) {
         this.attachMiddleware(res, [
+            this.corkMiddleware,
             this.corsMiddleware,
             this.appMiddleware,
             this.authMiddleware,
@@ -226,6 +237,7 @@ export class HttpHandler {
 
     channelUsers(res: HttpResponse) {
         this.attachMiddleware(res, [
+            this.corkMiddleware,
             this.corsMiddleware,
             this.appMiddleware,
             this.authMiddleware,
@@ -237,7 +249,11 @@ export class HttpHandler {
 
             this.server.adapter.getChannelMembers(res.params.appId, res.params.channel).then(members => {
                 let broadcastMessage = {
-                    users: [...members].map(([user_id, ]) => ({ id: user_id })),
+                    users: [...members].map(([user_id, user_info]) => {
+                        return res.query.with_user_info === '1'
+                            ? { id: user_id, user_info }
+                            : { id: user_id };
+                    }),
                 };
 
                 this.server.metricsManager.markApiMessage(res.params.appId, {}, broadcastMessage);
@@ -249,6 +265,7 @@ export class HttpHandler {
 
     events(res: HttpResponse) {
         this.attachMiddleware(res, [
+            this.corkMiddleware,
             this.jsonBodyMiddleware,
             this.corsMiddleware,
             this.appMiddleware,
@@ -257,6 +274,7 @@ export class HttpHandler {
         ]).then(res => {
             this.checkMessageToBroadcast(res.body as PusherApiMessage, res.app as App).then(message => {
                 this.broadcastMessage(message, res.app.id);
+                this.server.metricsManager.markApiMessage(res.app.id, res.body, { ok: true });
                 this.sendJson(res, { ok: true });
             }).catch(error => {
                 if (error.code === 400) {
@@ -285,6 +303,7 @@ export class HttpHandler {
 
             Promise.all(batch.map(message => this.checkMessageToBroadcast(message, res.app as App))).then(messages => {
                 messages.forEach(message => this.broadcastMessage(message, res.app.id));
+                this.server.metricsManager.markApiMessage(res.app.id, res.body, { ok: true });
                 this.sendJson(res, { ok: true });
             }).catch((error: MessageCheckError) => {
                 if (error.code === 400) {
@@ -293,6 +312,18 @@ export class HttpHandler {
                     this.entityTooLargeResponse(res, error.message);
                 }
             });
+        });
+    }
+
+    terminateUserConnections(res: HttpResponse) {
+        this.attachMiddleware(res, [
+            this.jsonBodyMiddleware,
+            this.corsMiddleware,
+            this.appMiddleware,
+            this.authMiddleware,
+        ]).then(res => {
+            this.server.adapter.terminateUserConnections(res.app.id, res.params.userId);
+            this.sendJson(res, { ok: true });
         });
     }
 
@@ -345,25 +376,38 @@ export class HttpHandler {
 
     protected broadcastMessage(message: PusherApiMessage, appId: string): void {
         message.channels.forEach(channel => {
-            this.server.adapter.send(appId, channel, JSON.stringify({
+            let msg = {
                 event: message.name,
                 channel,
                 data: message.data,
-            }), message.socket_id);
-        });
+            };
 
-        this.server.metricsManager.markApiMessage(appId, message, { ok: true });
+            this.server.adapter.send(appId, channel, JSON.stringify(msg), message.socket_id);
+
+            if (Utils.isCachingChannel(channel)) {
+                this.server.cacheManager.set(
+                    `app:${appId}:channel:${channel}:cache_miss`,
+                    JSON.stringify({ event: msg.event, data: msg.data }),
+                    this.server.options.channelLimits.cacheTtl,
+                );
+            }
+        });
     }
 
     notFound(res: HttpResponse) {
-        //Send status before any headers.
-        res.writeStatus('404 Not Found');
+        try {
+            res.writeStatus('404 Not Found');
 
-        this.attachMiddleware(res, [
-            this.corsMiddleware,
-        ]).then(res => {
-            this.send(res, '', '404 Not Found');
-        });
+            this.attachMiddleware(res, [
+                this.corkMiddleware,
+                this.corsMiddleware,
+            ]).then(res => {
+                this.send(res, '', '404 Not Found');
+            });
+        } catch (e) {
+            Log.warningTitle('Response could not be sent');
+            Log.warning(e);
+        }
     }
 
     protected badResponse(res: HttpResponse, error: string) {
@@ -375,7 +419,7 @@ export class HttpHandler {
     }
 
     protected unauthorizedResponse(res: HttpResponse, error: string) {
-        return this.sendJson(res, { error, code: 401 }, '401 Unauthorized');
+        return this.sendJson(res, { error, code: 401 }, '401 Authorization Required');
     }
 
     protected entityTooLargeResponse(res: HttpResponse, error: string) {
@@ -405,6 +449,10 @@ export class HttpHandler {
         }, err => {
             return this.badResponse(res, 'The received data is incorrect.');
         });
+    }
+
+    protected corkMiddleware(res: HttpResponse, next: CallableFunction): any {
+        res.cork(() => next(null, res));
     }
 
     protected corsMiddleware(res: HttpResponse, next: CallableFunction): any {
@@ -494,7 +542,8 @@ export class HttpHandler {
             let abortHandlerMiddleware = (res, callback) => {
                 res.onAborted(() => {
                     Log.warning({ message: 'Aborted request.', res });
-                    this.serverErrorResponse(res, 'Aborted request.');
+                    // No need to send back the response.
+                    // this.serverErrorResponse(res, 'Aborted request.');
                 });
 
                 callback(null, res);
@@ -587,18 +636,23 @@ export class HttpHandler {
     }
 
     protected sendJson(res: HttpResponse, data: any, status: RecognizedString = '200 OK') {
-        return res.writeStatus(status)
-            .writeHeader('Content-Type', 'application/json')
-            // TODO: Remove after uWS19.4
-            // @ts-ignore Remove after uWS 19.4 release
-            .end(JSON.stringify(data), true);
+        try {
+            return res.writeStatus(status)
+                .writeHeader('Content-Type', 'application/json')
+                .end(JSON.stringify(data), true);
+        } catch (e) {
+            Log.warningTitle('Response could not be sent');
+            Log.warning(e);
+        }
     }
 
     protected send(res: HttpResponse, data: RecognizedString, status: RecognizedString = '200 OK') {
-        return res.writeStatus(status)
-            // TODO: Remove after uWS19.4
-            // @ts-ignore Remove after uWS 19.4 release
-            .end(data, true);
+        try {
+            return res.writeStatus(status).end(data, true);
+        } catch (e) {
+            Log.warningTitle('Response could not be sent');
+            Log.warning(e);
+        }
     }
 
     /**

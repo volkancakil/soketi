@@ -3,7 +3,7 @@ const AWS = require('aws-sdk');
 let ddb = new AWS.DynamoDB({
     apiVersion: '2012-08-10',
     region: 'us-east-1',
-    endpoint: 'http://127.0.0.1:8000',
+    endpoint: `http://${process.env.DYNAMODB_URL || '127.0.0.1:8000'}`,
 });
 
 let createRecord = () => {
@@ -33,6 +33,7 @@ let createRecord = () => {
             // MaxEventNameLength: { N: '-1' },
             // MaxEventPayloadInKb: { N: '-1' },
             // MaxEventBatchSize: { N: '-1' },
+            // EnableUserAuthentication: { B: 'false' }
         },
     };
 

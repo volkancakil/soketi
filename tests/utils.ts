@@ -22,6 +22,10 @@ export class Utils {
         return (process.env.TEST_ADAPTER || 'local') === adapter;
     }
 
+    static queueDriverIs(queueDriver: string) {
+        return (process.env.TEST_QUEUE_DRIVER || 'sync') === queueDriver;
+    }
+
     static waitForPortsToFreeUp(): Promise<any> {
         return Promise.all([
             tcpPortUsed.waitUntilFree(6001, 500, 5 * 1000),
@@ -44,10 +48,14 @@ export class Utils {
             'cluster.port': parseInt((Math.random() * (20000 - 10000) + 10000).toString()), // random: 10000-20000
             'appManager.dynamodb.endpoint': 'http://127.0.0.1:8000',
             'cluster.ignoreProcess': false,
-            'webhooks.batching.enabled': false, // TODO: Find out why batching works but fails tests
-            'webhooks.batching.duration': 1,
+            'webhooks.batching.enabled': false,
+            'webhooks.batching.duration': 50,
+            'database.redis.enableOfflineQueue': true,
+            'appManager.cache.enabled': true,
+            'appManager.cache.ttl': -1,
             ...options,
             'adapter.driver': process.env.TEST_ADAPTER || 'local',
+            'cache.driver': process.env.TEST_CACHE_DRIVER || 'memory',
             'appManager.driver': process.env.TEST_APP_MANAGER || 'array',
             'queue.driver': process.env.TEST_QUEUE_DRIVER || 'sync',
             'rateLimiter.driver': process.env.TEST_RATE_LIMITER || 'local',
@@ -57,12 +65,21 @@ export class Utils {
             'database.postgres.user': process.env.TEST_POSTGRES_USER || 'testing',
             'database.postgres.password': process.env.TEST_POSTGRES_PASSWORD || 'testing',
             'database.postgres.database': process.env.TEST_POSTGRES_DATABASE || 'testing',
+            'queue.sqs.queueUrl': process.env.TEST_SQS_URL || 'http://localhost:4566/000000000000/test.fifo',
+            'debug': process.env.TEST_DEBUG || false,
+            'shutdownGracePeriod': 1_000,
         };
 
         return (new Server(options)).start((server: Server) => {
             this.wsServers.push(server);
 
-            callback(server);
+            if (server.options.cache.driver === 'redis') {
+                server.cacheManager.driver.redisConnection.flushdb().then(() => {
+                    callback(server);
+                });
+            } else {
+                callback(server);
+            }
         });
     }
 
@@ -92,15 +109,15 @@ export class Utils {
 
         let server = webhooksApp.listen(3001, () => {
             Log.successTitle('🎉 Webhook Server is up and running!');
+
+            server.on('error', err => {
+                console.log('Websocket server error', err);
+            });
+
+            this.httpServers.push(server);
+
+            onReadyCallback(server);
         });
-
-        server.on('error', err => {
-            console.log('Websocket server error', err);
-        });
-
-        this.httpServers.push(server);
-
-        onReadyCallback(server);
     }
 
     static flushWsServers(): Promise<void> {
@@ -177,7 +194,7 @@ export class Utils {
         });
     }
 
-    static newClientForPrivateChannel(clientOptions = {}, port = 6001, key = 'app-key'): any {
+    static newClientForPrivateChannel(clientOptions = {}, port = 6001, key = 'app-key', userData = {}): any {
         return this.newClient({
             authorizer: (channel, options) => ({
                 authorize: (socketId, callback) => {
@@ -187,35 +204,59 @@ export class Utils {
                     });
                 },
             }),
+            userAuthentication: {
+                customHandler: ({ socketId }, callback) => {
+                    callback(false, {
+                        auth: this.signTokenForUserAuthentication(socketId, JSON.stringify(userData), key),
+                        user_data: JSON.stringify(userData),
+                    });
+                },
+            },
             ...clientOptions,
         }, port, key);
     }
 
-    static newClientForEncryptedPrivateChannel(clientOptions = {}, port = 6001, key = 'app-key'): any {
+    static newClientForEncryptedPrivateChannel(clientOptions = {}, port = 6001, key = 'app-key', userData = {}): any {
         return this.newClient({
             authorizer: (channel, options) => ({
                 authorize: (socketId, callback) => {
                     callback(false, {
-                        auth: this.signTokenForPrivateChannel(socketId, channel),
+                        auth: this.signTokenForPrivateChannel(socketId, channel, key),
                         channel_data: null,
                         shared_secret: this.newBackend().channelSharedSecret(channel.name).toString('base64'),
                     });
                 },
             }),
+            userAuthentication: {
+                customHandler: ({ socketId }, callback) => {
+                    callback(false, {
+                        auth: this.signTokenForUserAuthentication(socketId, JSON.stringify(userData), key),
+                        user_data: JSON.stringify(userData),
+                    });
+                },
+            },
             ...clientOptions,
         }, port, key);
     }
 
-    static newClientForPresenceUser(user: any, clientOptions = {}, port = 6001, key = 'app-key'): any {
+    static newClientForPresenceUser(user: any, clientOptions = {}, port = 6001, key = 'app-key', userData = {}): any {
         return this.newClient({
             authorizer: (channel, options) => ({
                 authorize: (socketId, callback) => {
                     callback(false, {
-                        auth: this.signTokenForPresenceChannel(socketId, channel, user),
+                        auth: this.signTokenForPresenceChannel(socketId, channel, user, key),
                         channel_data: JSON.stringify(user),
                     });
                 },
             }),
+            userAuthentication: {
+                customHandler: ({ socketId }, callback) => {
+                    callback(false, {
+                        auth: this.signTokenForUserAuthentication(socketId, JSON.stringify(userData), key),
+                        user_data: JSON.stringify(userData),
+                    });
+                },
+            },
             ...clientOptions,
         }, port, key);
     }
@@ -241,6 +282,17 @@ export class Utils {
         let token = new Pusher.Token(key, secret);
 
         return key + ':' + token.sign(`${socketId}:${channel.name}:${JSON.stringify(channelData)}`);
+    }
+
+    static signTokenForUserAuthentication(
+        socketId: string,
+        userData: string,
+        key = 'app-key',
+        secret = 'app-secret'
+    ): string {
+        let token = new Pusher.Token(key, secret);
+
+        return key + ':' + token.sign(`${socketId}::user::${userData}`);
     }
 
     static wait(ms): Promise<void> {

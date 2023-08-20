@@ -112,4 +112,45 @@ describe('public channel test', () => {
             });
         });
     });
+
+    test('cached public channels work', done => {
+        Utils.newServer({}, (server: Server) => {
+            let client1 = Utils.newClient();
+            let backend = Utils.newBackend();
+            let channelName = `cache-${Utils.randomChannelName()}`;
+
+            client1.connection.bind('connected', () => {
+                let channel = client1.subscribe(channelName);
+
+                channel.bind('pusher:subscription_succeeded', () => {
+                    channel.bind('pusher:cache_miss', (data) => {
+                        expect(data).toBe(undefined);
+
+                        channel.bind('greeting', e => {
+                            expect(e.message).toBe('hello');
+    
+                            let client2 = Utils.newClient();
+    
+                            client2.connection.bind('connected', () => {
+                                let channel = client2.subscribe(channelName);
+
+                                channel.bind('pusher:cache_miss', () => {
+                                    throw new Error('Did not expect cache_miss to be invoked.');
+                                });
+
+                                channel.bind('greeting', e => {
+                                    expect(e.message).toBe('hello');
+                                    done()
+                                })
+                            });
+                        });
+                    });
+
+                    backend.trigger(channelName, 'greeting', { message: 'hello' }).catch(error => {
+                        throw new Error(error);
+                    });
+                });
+            });
+        });
+    });
 });

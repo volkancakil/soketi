@@ -1,6 +1,8 @@
 import * as dot from 'dot-wild';
 import { Adapter, AdapterInterface } from './adapters';
 import { AppManager, AppManagerInterface } from './app-managers';
+import { CacheManager } from './cache-managers/cache-manager';
+import { CacheManagerInterface } from './cache-managers/cache-manager-interface';
 import { HttpHandler } from './http-handler';
 import { HttpRequest, HttpResponse, TemplatedApp } from 'uWebSockets.js';
 import { Log } from './log';
@@ -29,11 +31,27 @@ export class Server {
         adapter: {
             driver: 'local',
             redis: {
+                requestsTimeout: 5_000,
                 prefix: '',
+                redisPubOptions: {
+                    //
+                },
+                redisSubOptions: {
+                    //
+                },
+                clusterMode: false,
+                shardMode: false,
+            },
+            cluster: {
+                requestsTimeout: 5_000,
             },
         },
         appManager: {
             driver: 'array',
+            cache: {
+                enabled: false,
+                ttl: -1,
+            },
             array: {
                 apps: [
                     {
@@ -65,11 +83,21 @@ export class Server {
                 version: '13.3',
             },
         },
+        cache: {
+            driver: 'memory',
+            redis: {
+                redisOptions: {
+                    //
+                },
+                clusterMode: false,
+            },
+        },
         channelLimits: {
             maxNameLength: 200,
+            cacheTtl: 3600,
         },
         cluster: {
-            host: '0.0.0.0',
+            hostname: '0.0.0.0',
             helloInterval: 500,
             checkInterval: 500,
             nodeTimeout: 2000,
@@ -77,6 +105,9 @@ export class Server {
             port: 11002,
             prefix: '',
             ignoreProcess: true,
+            broadcast: '255.255.255.255',
+            unicast: null,
+            multicast: null,
         },
         cors: {
             credentials: true,
@@ -119,6 +150,7 @@ export class Server {
                 sentinels: null,
                 sentinelPassword: null,
                 name: 'mymaster',
+                clusterNodes: [],
             },
         },
         databasePooling: {
@@ -133,6 +165,7 @@ export class Server {
             maxPayloadInKb: 100,
             maxBatchSize: 10,
         },
+        host: '0.0.0.0',
         httpApi: {
             requestLimitInMb: 100,
             acceptTraffic: {
@@ -145,6 +178,7 @@ export class Server {
         metrics: {
             enabled: false,
             driver: 'prometheus',
+            host: '0.0.0.0',
             prometheus: {
                 prefix: 'soketi_',
             },
@@ -161,10 +195,30 @@ export class Server {
             driver: 'sync',
             redis: {
                 concurrency: 1,
+                redisOptions: {
+                    //
+                },
+                clusterMode: false,
+            },
+            sqs: {
+                region: 'us-east-1',
+                endpoint: null,
+                clientOptions: {},
+                consumerOptions: {},
+                queueUrl: '',
+                processBatch: false,
+                batchSize: 1,
+                pollingWaitTimeMs: 0,
             },
         },
         rateLimiter: {
             driver: 'local',
+            redis: {
+                redisOptions: {
+                    //
+                },
+                clusterMode: false,
+            },
         },
         shutdownGracePeriod: 3_000,
         ssl: {
@@ -173,6 +227,7 @@ export class Server {
             passphrase: '',
             caPath: '',
         },
+        userAuthenticationTimeout: 30_000,
         webhooks: {
             batching: {
                 enabled: false,
@@ -232,6 +287,11 @@ export class Server {
     public queueManager: QueueInterface;
 
     /**
+     * The cache manager.
+     */
+    public cacheManager: CacheManagerInterface;
+
+    /**
      * The sender for webhooks.
      */
     public webhookSender: WebhookSender;
@@ -269,61 +329,66 @@ export class Server {
      * Start the server.
      */
     async start(callback?: CallableFunction) {
+        Log.br();
+
         this.configureDiscovery().then(() => {
-            this.initializeDrivers();
+            this.initializeDrivers().then(() => {
 
-            if (this.options.debug) {
-                console.dir(this.options, { depth: 100 });
-            }
-
-            this.wsHandler = new WsHandler(this);
-            this.httpHandler = new HttpHandler(this);
-
-            if (this.options.debug) {
-                Log.info('\n📡 soketi initialization....\n');
-                Log.info('⚡ Initializing the HTTP API & Websockets Server...\n');
-            }
-
-            let server: TemplatedApp = this.shouldConfigureSsl()
-                ? uWS.SSLApp({
-                    key_file_name: this.options.ssl.keyPath,
-                    cert_file_name: this.options.ssl.certPath,
-                    passphrase: this.options.ssl.passphrase,
-                    ca_file_name: this.options.ssl.caPath,
-                })
-                : uWS.App();
-
-            let metricsServer: TemplatedApp = uWS.App();
-
-            if (this.options.debug) {
-                Log.info('⚡ Initializing the Websocket listeners and channels...\n');
-            }
-
-            this.configureWebsockets(server).then(server => {
                 if (this.options.debug) {
-                    Log.info('⚡ Initializing the HTTP webserver...\n');
+                    console.dir(this.options, { depth: 100 });
                 }
 
-                this.configureHttp(server).then(server => {
-                    this.configureMetricsServer(metricsServer).then(metricsServer => {
-                        metricsServer.listen('0.0.0.0', this.options.metrics.port, metricsServerProcess => {
-                            this.metricsServerProcess = metricsServerProcess;
+                this.wsHandler = new WsHandler(this);
+                this.httpHandler = new HttpHandler(this);
 
-                            server.listen('0.0.0.0', this.options.port, serverProcess => {
-                                this.serverProcess = serverProcess;
+                if (this.options.debug) {
+                    Log.info('📡 soketi initialization....');
+                    Log.info('⚡ Initializing the HTTP API & Websockets Server...');
+                }
 
-                                Log.successTitle('🎉 Server is up and running!\n');
-                                Log.successTitle(`📡 The Websockets server is available at 127.0.0.1:${this.options.port}\n`);
-                                Log.successTitle(`🔗 The HTTP API server is available at http://127.0.0.1:${this.options.port}\n`);
-                                Log.successTitle(`🎊 The /usage endpoint is available on port ${this.options.metrics.port}.\n`);
+                let server: TemplatedApp = this.shouldConfigureSsl()
+                    ? uWS.SSLApp({
+                        key_file_name: this.options.ssl.keyPath,
+                        cert_file_name: this.options.ssl.certPath,
+                        passphrase: this.options.ssl.passphrase,
+                        ca_file_name: this.options.ssl.caPath,
+                    })
+                    : uWS.App();
 
-                                if (this.options.metrics.enabled) {
-                                    Log.successTitle(`🌠 Prometheus /metrics endpoint is available on port ${this.options.metrics.port}.\n`);
-                                }
+                let metricsServer: TemplatedApp = uWS.App();
 
-                                if (callback) {
-                                    callback(this);
-                                }
+                if (this.options.debug) {
+                    Log.info('⚡ Initializing the Websocket listeners and channels...');
+                }
+
+                this.configureWebsockets(server).then(server => {
+                    if (this.options.debug) {
+                        Log.info('⚡ Initializing the HTTP webserver...');
+                    }
+
+                    this.configureHttp(server).then(server => {
+                        this.configureMetricsServer(metricsServer).then(metricsServer => {
+                            metricsServer.listen(this.options.metrics.host, this.options.metrics.port, metricsServerProcess => {
+                                this.metricsServerProcess = metricsServerProcess;
+
+                                server.listen(this.options.host, this.options.port, serverProcess => {
+                                    this.serverProcess = serverProcess;
+
+                                    Log.successTitle('🎉 Server is up and running!');
+                                    Log.successTitle(`📡 The Websockets server is available at 127.0.0.1:${this.options.port}`);
+                                    Log.successTitle(`🔗 The HTTP API server is available at http://127.0.0.1:${this.options.port}`);
+                                    Log.successTitle(`🎊 The /usage endpoint is available on port ${this.options.metrics.port}.`);
+
+                                    if (this.options.metrics.enabled) {
+                                        Log.successTitle(`🌠 Prometheus /metrics endpoint is available on port ${this.options.metrics.port}.`);
+                                    }
+
+                                    Log.br();
+
+                                    if (callback) {
+                                        callback(this);
+                                    }
+                                });
                             });
                         });
                     });
@@ -338,28 +403,35 @@ export class Server {
     stop(): Promise<void> {
         this.closing = true;
 
-        Log.warning('🚫 New users cannot connect to this instance anymore. Preparing for signaling...\n');
-        Log.warning('⚡ The server is closing and signaling the existing connections to terminate.\n');
+        Log.br();
+        Log.warning('🚫 New users cannot connect to this instance anymore. Preparing for signaling...');
+        Log.warning('⚡ The server is closing and signaling the existing connections to terminate.');
+        Log.br();
 
         return this.wsHandler.closeAllLocalSockets().then(() => {
-            return Promise.all([
-                this.metricsManager.clear(),
-                this.queueManager.clear(),
-                this.rateLimiter.clear(this.closing),
-            ]).then(() => {
+            return new Promise(resolve => {
                 if (this.options.debug) {
                     Log.warningTitle('⚡ All sockets were closed. Now closing the server.');
                 }
 
-                if (this.serverProcess) {
-                    uWS.us_listen_socket_close(this.serverProcess);
-                }
+                setTimeout(() => {
+                    Promise.all([
+                        this.metricsManager.clear(),
+                        this.queueManager.disconnect(),
+                        this.rateLimiter.disconnect(),
+                        this.cacheManager.disconnect(),
+                    ]).then(() => {
+                        this.adapter.disconnect().then(() => {
+                            if (this.serverProcess) {
+                                uWS.us_listen_socket_close(this.serverProcess);
+                            }
 
-                if (this.metricsServerProcess) {
-                    uWS.us_listen_socket_close(this.metricsServerProcess);
-                }
-
-                return new Promise(resolve => setTimeout(resolve, this.options.shutdownGracePeriod));
+                            if (this.metricsServerProcess) {
+                                uWS.us_listen_socket_close(this.metricsServerProcess);
+                            }
+                        }).then(() => resolve());
+                    });
+                }, this.options.shutdownGracePeriod);
             });
         });
     }
@@ -384,14 +456,16 @@ export class Server {
     /**
      * Initialize the drivers for the server.
      */
-    initializeDrivers(): void {
-        this.setAppManager(new AppManager(this));
-        this.setAdapter(new Adapter(this));
-        this.setMetricsManager(new Metrics(this));
-        this.setRateLimiter(new RateLimiter(this));
-        this.setQueueManager(new Queue(this));
-        // TODO: Make webhook sender extendable.
-        this.webhookSender = new WebhookSender(this);
+    initializeDrivers(): Promise<any> {
+        return Promise.all([
+            this.setAppManager(new AppManager(this)),
+            this.setAdapter(new Adapter(this)),
+            this.setMetricsManager(new Metrics(this)),
+            this.setRateLimiter(new RateLimiter(this)),
+            this.setQueueManager(new Queue(this)),
+            this.setCacheManager(new CacheManager(this)),
+            this.setWebhookSender(),
+        ]);
     }
 
     /**
@@ -404,29 +478,63 @@ export class Server {
     /**
      * Set the adapter.
      */
-    setAdapter(instance: AdapterInterface) {
-        this.adapter = instance;
+    setAdapter(instance: AdapterInterface): Promise<void> {
+        return new Promise(resolve => {
+            instance.init().then(() => {
+                this.adapter = instance;
+                resolve();
+            });
+        });
     }
 
     /**
      * Set the metrics manager.
      */
-    setMetricsManager(instance: MetricsInterface) {
-        this.metricsManager = instance;
+    setMetricsManager(instance: MetricsInterface): Promise<void> {
+        return new Promise(resolve => {
+            this.metricsManager = instance;
+            resolve();
+        });
     }
 
     /**
      * Set the rate limiter.
      */
-    setRateLimiter(instance: RateLimiterInterface) {
-        this.rateLimiter = instance;
+    setRateLimiter(instance: RateLimiterInterface): Promise<void> {
+        return new Promise(resolve => {
+            this.rateLimiter = instance;
+            resolve();
+        });
     }
 
     /**
      * Set the queue manager.
      */
-    setQueueManager(instance: QueueInterface) {
-        this.queueManager = instance;
+    setQueueManager(instance: QueueInterface): Promise<void> {
+        return new Promise(resolve => {
+            this.queueManager = instance;
+            resolve();
+        });
+    }
+
+    /**
+     * Set the cache manager.
+     */
+    setCacheManager(instance: CacheManagerInterface): Promise<void> {
+        return new Promise(resolve => {
+            this.cacheManager = instance;
+            resolve();
+        });
+    }
+
+    /**
+     * Set the webhook sender.
+     */
+    setWebhookSender(): Promise<void> {
+        return new Promise(resolve => {
+            this.webhookSender = new WebhookSender(this);
+            resolve();
+        });
     }
 
     /**
@@ -584,6 +692,15 @@ export class Server {
 
                     return this.httpHandler.batchEvents(res);
                 });
+
+                server.post(this.url('/apps/:appId/users/:userId/terminate_connections'), (res, req) => {
+                    res.params = { appId: req.getParameter(0), userId: req.getParameter(1) };
+                    res.query = queryString.parse(req.getQuery());
+                    res.method = req.getMethod().toUpperCase();
+                    res.url = req.getUrl();
+
+                    return this.httpHandler.terminateUserConnections(res);
+                });
             }
 
             server.any(this.url('/*'), (res, req) => {
@@ -599,7 +716,8 @@ export class Server {
      */
     protected configureMetricsServer(metricsServer: TemplatedApp): Promise<TemplatedApp> {
         return new Promise(resolve => {
-            Log.info('🕵️‍♂️ Initiating metrics endpoints...\n');
+            Log.info('🕵️‍♂️ Initiating metrics endpoints...');
+            Log.br();
 
             metricsServer.get(this.url('/'), (res, req) => this.httpHandler.healthCheck(res));
             metricsServer.get(this.url('/ready'), (res, req) => this.httpHandler.ready(res));

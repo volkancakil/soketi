@@ -1,4 +1,7 @@
 import { AppInterface } from './app';
+import { ClusterOptions, RedisOptions } from 'ioredis';
+import { ConsumerOptions } from 'sqs-consumer';
+import { SQS } from 'aws-sdk';
 
 interface Redis {
     host: string;
@@ -10,9 +13,15 @@ interface Redis {
     sentinels: RedisSentinel[];
     sentinelPassword: string|null;
     name: string;
+    clusterNodes: ClusterNode[];
 }
 
 interface RedisSentinel {
+    host: string;
+    port: number;
+}
+
+interface ClusterNode {
     host: string;
     port: number;
 }
@@ -29,13 +38,25 @@ export interface Options {
     adapter: {
         driver: string;
         redis: {
+            requestsTimeout: number;
             prefix: string;
+            redisPubOptions: any;
+            redisSubOptions: any;
+            clusterMode: boolean;
+            shardMode: boolean;
         };
+        cluster: {
+            requestsTimeout: number;
+        },
     };
     appManager: {
         driver: string;
         array: {
             apps: AppInterface[];
+        };
+        cache: {
+            enabled: boolean;
+            ttl: number;
         };
         dynamodb: {
             table: string;
@@ -52,11 +73,19 @@ export interface Options {
             version: string|number;
         };
     };
+    cache: {
+        driver: string;
+        redis: {
+            redisOptions: RedisOptions|ClusterOptions;
+            clusterMode: boolean;
+        };
+    };
     channelLimits: {
         maxNameLength: number;
+        cacheTtl: number;
     };
     cluster: {
-        host: string;
+        hostname: string;
         helloInterval: number;
         checkInterval: number;
         nodeTimeout: number,
@@ -64,6 +93,9 @@ export interface Options {
         port: number;
         prefix: string;
         ignoreProcess: boolean;
+        broadcast: string;
+        unicast: string|null;
+        multicast: string|null;
     };
     cors: {
         credentials: boolean;
@@ -88,6 +120,7 @@ export interface Options {
         maxPayloadInKb: string|number;
         maxBatchSize: string|number;
     };
+    host: string;
     httpApi: {
         requestLimitInMb: string|number;
         acceptTraffic: {
@@ -100,6 +133,7 @@ export interface Options {
     metrics: {
         enabled: boolean;
         driver: string;
+        host: string;
         prometheus: {
             prefix: string;
         };
@@ -116,10 +150,26 @@ export interface Options {
         driver: string;
         redis: {
             concurrency: number;
+            redisOptions: RedisOptions|ClusterOptions;
+            clusterMode: boolean;
+        };
+        sqs: {
+            region?: string;
+            endpoint?: string;
+            clientOptions?: SQS.Types.ClientConfiguration;
+            consumerOptions?: ConsumerOptions;
+            queueUrl: string;
+            processBatch: boolean;
+            batchSize: number;
+            pollingWaitTimeMs: number;
         };
     };
     rateLimiter: {
         driver: string;
+        redis: {
+            redisOptions: RedisOptions|ClusterOptions;
+            clusterMode: boolean;
+        };
     };
     shutdownGracePeriod: number;
     ssl: {
@@ -128,6 +178,7 @@ export interface Options {
         passphrase: string;
         caPath: string;
     };
+    userAuthenticationTimeout: number;
     webhooks: {
         batching: {
             enabled: boolean;

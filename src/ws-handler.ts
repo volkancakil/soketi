@@ -5,7 +5,7 @@ import { HttpRequest, HttpResponse } from 'uWebSockets.js';
 import { Log } from './log';
 import { Namespace } from './namespace';
 import { PresenceChannelManager } from './channels';
-import { PresenceMember, PresenceMemberInfo } from './channels/presence-channel-manager';
+import { PresenceMemberInfo } from './channels/presence-channel-manager';
 import { PrivateChannelManager } from './channels';
 import { PublicChannelManager } from './channels';
 import { PusherMessage, uWebSocketMessage } from './message';
@@ -14,6 +14,7 @@ import { Utils } from './utils';
 import { WebSocket } from 'uWebSockets.js';
 
 const ab2str = require('arraybuffer-to-string');
+const Pusher = require('pusher');
 
 export class WsHandler {
     /**
@@ -74,6 +75,10 @@ export class WsHandler {
             }
         }
 
+        ws.id = this.generateSocketId();
+        ws.subscribedChannels = new Set();
+        ws.presence = new Map<string, PresenceMemberInfo>();
+
         if (this.server.closing) {
             ws.sendJson({
                 event: 'pusher:error',
@@ -83,13 +88,8 @@ export class WsHandler {
                 },
             });
 
-            // See: https://www.iana.org/assignments/websocket/websocket.xhtml
-            return ws.end(1012);
+            return ws.end(4200);
         }
-
-        ws.id = this.generateSocketId();
-        ws.subscribedChannels = new Set();
-        ws.presence = new Map<string, PresenceMemberInfo>();
 
         this.checkForValidApp(ws).then(validApp => {
             if (!validApp) {
@@ -101,8 +101,7 @@ export class WsHandler {
                     },
                 });
 
-                // See: https://www.iana.org/assignments/websocket/websocket.xhtml
-                return ws.end(1002);
+                return ws.end(4001);
             }
 
             ws.app = validApp.forWebSocket();
@@ -117,38 +116,43 @@ export class WsHandler {
                         },
                     });
 
-                    // See: https://www.iana.org/assignments/websocket/websocket.xhtml
-                    return ws.end(1002);
+                    return ws.end(4003);
                 }
 
-                this.checkAppConnectionLimit(ws).then(canConnect => {
-                    if (!canConnect) {
-                        ws.sendJson({
-                            event: 'pusher:error',
-                            data: {
-                                code: 4100,
-                                message: 'The current concurrent connections quota has been reached.',
-                            },
-                        });
+                // Notify the adapter someone is using the app.
+                this.server.adapter.subscribeToApp(ws.app.id).then(() => {
+                    this.checkAppConnectionLimit(ws).then(canConnect => {
+                        if (!canConnect) {
+                            ws.sendJson({
+                                event: 'pusher:error',
+                                data: {
+                                    code: 4004,
+                                    message: 'The current concurrent connections quota has been reached.',
+                                },
+                            });
 
-                        // See: https://www.iana.org/assignments/websocket/websocket.xhtml
-                        ws.end(1013);
-                    } else {
-                        // Make sure to update the socket after new data was pushed in.
-                        this.server.adapter.getNamespace(ws.app.id).addSocket(ws);
+                            ws.end(4100);
+                        } else {
+                            // Make sure to update the socket after new data was pushed in.
+                            this.server.adapter.addSocket(ws.app.id, ws);
 
-                        let broadcastMessage = {
-                            event: 'pusher:connection_established',
-                            data: JSON.stringify({
-                                socket_id: ws.id,
-                                activity_timeout: 30,
-                            }),
-                        };
+                            let broadcastMessage = {
+                                event: 'pusher:connection_established',
+                                data: JSON.stringify({
+                                    socket_id: ws.id,
+                                    activity_timeout: 30,
+                                }),
+                            };
 
-                        ws.sendJson(broadcastMessage);
+                            ws.sendJson(broadcastMessage);
 
-                        this.server.metricsManager.markNewConnection(ws);
-                    }
+                            if (ws.app.enableUserAuthentication) {
+                                this.setUserAuthenticationTimeout(ws);
+                            }
+
+                            this.server.metricsManager.markNewConnection(ws);
+                        }
+                    });
                 });
             });
         });
@@ -180,6 +184,8 @@ export class WsHandler {
                 this.unsubscribeFromChannel(ws, message.data.channel);
             } else if (Utils.isClientEvent(message.event)) {
                 this.handleClientEvent(ws, message);
+            } else if (message.event === 'pusher:signin') {
+                this.handleSignin(ws, message);
             } else {
                 Log.warning({
                     info: 'Message event handler not implemented.',
@@ -202,9 +208,19 @@ export class WsHandler {
             Log.websocket({ ws, code, message });
         }
 
-        this.unsubscribeFromAllChannels(ws).then(() => {
+        // If code 4200 (reconnect immediately) is called, it means the `closeAllLocalSockets()` was called.
+        if (code !== 4200) {
+            this.evictSocketFromMemory(ws);
+        }
+    }
+
+    /**
+     * Evict the local socket.
+     */
+    evictSocketFromMemory(ws: WebSocket): Promise<void> {
+        return this.unsubscribeFromAllChannels(ws, true).then(() => {
             if (ws.app) {
-                this.server.adapter.getNamespace(ws.app.id).removeSocket(ws.id);
+                this.server.adapter.removeSocket(ws.app.id, ws.id);
                 this.server.metricsManager.markDisconnection(ws);
             }
 
@@ -234,22 +250,23 @@ export class WsHandler {
                             },
                         });
 
-                        // See: https://www.iana.org/assignments/websocket/websocket.xhtml
-                        ws.end(1012);
+                        ws.end(4200);
                     } catch (e) {
                         //
                     }
 
-                    wsCallback();
+                    this.evictSocketFromMemory(ws).then(() => {
+                        wsCallback();
+                    });
                 }).then(() => {
-                    this.server.adapter.clear(namespaceId).then(() => {
+                    this.server.adapter.clearNamespace(namespaceId).then(() => {
                         nsCallback();
                     });
                 });
             });
         }).then(() => {
             // One last clear to make sure everything went away.
-            return this.server.adapter.clear(null, this.server.closing);
+            return this.server.adapter.clearNamespaces();
         });
     }
 
@@ -288,8 +305,9 @@ export class WsHandler {
                 },
             });
 
-            // See: https://www.iana.org/assignments/websocket/websocket.xhtml
-            return ws.end(1012);
+            ws.end(4200);
+
+            this.evictSocketFromMemory(ws);
         }
     }
 
@@ -306,8 +324,11 @@ export class WsHandler {
                 },
             });
 
-            // See: https://www.iana.org/assignments/websocket/websocket.xhtml
-            return ws.end(1012);
+            ws.end(4200);
+
+            this.evictSocketFromMemory(ws);
+
+            return;
         }
 
         let channel = message.data.channel;
@@ -363,7 +384,7 @@ export class WsHandler {
             }
 
             // Make sure to update the socket after new data was pushed in.
-            this.server.adapter.getNamespace(ws.app.id).addSocket(ws);
+            this.server.adapter.addSocket(ws.app.id, ws);
 
             // If the connection freshly joined, send the webhook:
             if (response.channelConnections === 1) {
@@ -379,6 +400,10 @@ export class WsHandler {
 
                 ws.sendJson(broadcastMessage);
 
+                if (Utils.isCachingChannel(channel)) {
+                    this.sendMissedCacheIfExists(ws, channel);
+                }
+
                 return;
             }
 
@@ -389,7 +414,7 @@ export class WsHandler {
                 ws.presence.set(channel, response.member);
 
                 // Make sure to update the socket after new data was pushed in.
-                this.server.adapter.getNamespace(ws.app.id).addSocket(ws);
+                this.server.adapter.addSocket(ws.app.id, ws);
 
                 // If the member already exists in the channel, don't resend the member_added event.
                 if (!members.has(user_id as string)) {
@@ -420,6 +445,10 @@ export class WsHandler {
                 };
 
                 ws.sendJson(broadcastMessage);
+
+                if (Utils.isCachingChannel(channel)) {
+                    this.sendMissedCacheIfExists(ws, channel);
+                }
             }).catch(err => {
                 Log.error(err);
 
@@ -439,7 +468,7 @@ export class WsHandler {
     /**
      * Instruct the server to unsubscribe the connection from the channel.
      */
-    unsubscribeFromChannel(ws: WebSocket, channel: string): Promise<void> {
+    unsubscribeFromChannel(ws: WebSocket, channel: string, closing = false): Promise<void> {
         let channelManager = this.getChannelManagerFor(channel);
 
         return channelManager.leave(ws, channel).then(response => {
@@ -452,7 +481,7 @@ export class WsHandler {
                     ws.presence.delete(channel);
 
                     // Make sure to update the socket after new data was pushed in.
-                    this.server.adapter.getNamespace(ws.app.id).addSocket(ws);
+                    this.server.adapter.addSocket(ws.app.id, ws);
 
                     this.server.adapter.getChannelMembers(ws.app.id, channel, false).then(members => {
                         if (!members.has(member.user_id as string)) {
@@ -471,8 +500,11 @@ export class WsHandler {
 
                 ws.subscribedChannels.delete(channel);
 
-                // Make sure to update the socket after new data was pushed in.
-                this.server.adapter.getNamespace(ws.app.id).addSocket(ws);
+                // Make sure to update the socket after new data was pushed in,
+                // but only if the user is not closing the connection.
+                if (!closing) {
+                    this.server.adapter.addSocket(ws.app.id, ws);
+                }
 
                 if (response.remainingConnections === 0) {
                     this.server.webhookSender.sendChannelVacated(ws.app, channel);
@@ -491,14 +523,19 @@ export class WsHandler {
     /**
      * Unsubscribe the connection from all channels.
      */
-    unsubscribeFromAllChannels(ws: WebSocket): Promise<void> {
+    unsubscribeFromAllChannels(ws: WebSocket, closing = true): Promise<void> {
         if (!ws.subscribedChannels) {
             return Promise.resolve();
         }
 
-        return async.each(ws.subscribedChannels, (channel, callback) => {
-            this.unsubscribeFromChannel(ws, channel).then(() => callback());
-        });
+        return Promise.all([
+            async.each(ws.subscribedChannels, (channel, callback) => {
+                this.unsubscribeFromChannel(ws, channel, closing).then(() => callback());
+            }),
+            ws.app && ws.user ? this.server.adapter.removeUser(ws) : new Promise<void>(resolve => resolve()),
+        ]).then(() => {
+            return;
+        })
     }
 
     /**
@@ -559,15 +596,19 @@ export class WsHandler {
 
             this.server.rateLimiter.consumeFrontendEventPoints(1, ws.app, ws).then(response => {
                 if (response.canContinue) {
-                    this.server.adapter.send(ws.app.id, channel, JSON.stringify({ event, channel, data }), ws.id);
+                    let userId = ws.presence.has(channel) ? ws.presence.get(channel).user_id : null;
+
+                    let message = JSON.stringify({
+                        event,
+                        channel,
+                        data,
+                        ...userId ? { user_id: userId } : {},
+                    });
+
+                    this.server.adapter.send(ws.app.id, channel, message, ws.id);
 
                     this.server.webhookSender.sendClientEvent(
-                        ws.app,
-                        channel,
-                        event,
-                        data,
-                        ws.id,
-                        ws.presence.has(channel) ? ws.presence.get(channel).user_id : null,
+                        ws.app, channel, event, data, ws.id, userId,
                     );
 
                     return;
@@ -582,6 +623,90 @@ export class WsHandler {
                     },
                 });
             });
+        });
+    }
+
+    /**
+     * Handle the signin coming from the frontend.
+     */
+    handleSignin(ws: WebSocket, message: PusherMessage): void {
+        if (!ws.userAuthenticationTimeout) {
+            return;
+        }
+
+        this.signinTokenIsValid(ws, message.data.user_data, message.data.auth).then(isValid => {
+            if (!isValid) {
+                ws.sendJson({
+                    event: 'pusher:error',
+                    data: {
+                        code: 4009,
+                        message: 'Connection not authorized.',
+                    },
+                });
+
+                try {
+                    ws.end(4009);
+                } catch (e) {
+                    //
+                }
+
+                return;
+            }
+
+            let decodedUser = JSON.parse(message.data.user_data);
+
+            if (!decodedUser.id) {
+                ws.sendJson({
+                    event: 'pusher:error',
+                    data: {
+                        code: 4009,
+                        message: 'The returned user data must contain the "id" field.',
+                    },
+                });
+
+                try {
+                    ws.end(4009);
+                } catch (e) {
+                    //
+                }
+
+                return;
+            }
+
+            ws.user = {
+                ...decodedUser,
+                ...{
+                    id: decodedUser.id.toString(),
+                },
+            };
+
+            if (ws.userAuthenticationTimeout) {
+                clearTimeout(ws.userAuthenticationTimeout);
+            }
+
+            this.server.adapter.addSocket(ws.app.id, ws);
+
+            this.server.adapter.addUser(ws).then(() => {
+                ws.sendJson({
+                    event: 'pusher:signin_success',
+                    data: message.data,
+                });
+            });
+        });
+    }
+
+    /**
+     * Send the first event as cache_missed, if it exists, to catch up.
+     */
+    sendMissedCacheIfExists(ws: WebSocket, channel: string) {
+        this.server.cacheManager.get(`app:${ws.app.id}:channel:${channel}:cache_miss`).then(cachedEvent => {
+            if (cachedEvent) {
+                let { event, data } = JSON.parse(cachedEvent);
+                ws.sendJson({ event: event, channel, data: data });
+            } else {
+                ws.sendJson({ event: 'pusher:cache_miss', channel });
+                this.server.webhookSender.sendCacheMissed(ws.app, channel);
+            }
         });
     }
 
@@ -635,6 +760,29 @@ export class WsHandler {
     }
 
     /**
+     * Check is an incoming connection can subscribe.
+     */
+    signinTokenIsValid(ws: WebSocket, userData: string, signatureToCheck: string): Promise<boolean> {
+        return this.signinTokenForUserData(ws, userData).then(expectedSignature => {
+            return signatureToCheck === expectedSignature;
+        });
+    }
+
+    /**
+     * Get the signin token from the given message, by the Socket.
+     */
+    protected signinTokenForUserData(ws: WebSocket, userData: string): Promise<string> {
+        return new Promise(resolve => {
+            let decodedString = `${ws.id}::user::${userData}`;
+            let token = new Pusher.Token(ws.app.key, ws.app.secret);
+
+            resolve(
+                ws.app.key + ':' + token.sign(decodedString)
+            );
+        });
+    }
+
+    /**
      * Generate a Pusher-like Socket ID.
      */
     protected generateSocketId(): string {
@@ -662,8 +810,32 @@ export class WsHandler {
         this.clearTimeout(ws);
 
         ws.timeout = setTimeout(() => {
-            // See: https://www.iana.org/assignments/websocket/websocket.xhtml
-            ws.end(1006);
+            try {
+                ws.end(4201);
+            } catch (e) {
+                //
+            }
         }, 120_000);
+    }
+
+    /**
+     * Set the authentication timeout for the socket.
+     */
+    protected setUserAuthenticationTimeout(ws: WebSocket): void {
+        ws.userAuthenticationTimeout = setTimeout(() => {
+            ws.sendJson({
+                event: 'pusher:error',
+                data: {
+                    code: 4009,
+                    message: 'Connection not authorized within timeout.',
+                },
+            });
+
+            try {
+                ws.end(4009);
+            } catch (e) {
+                //
+            }
+        }, this.server.options.userAuthenticationTimeout);
     }
 }
